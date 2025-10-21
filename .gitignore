@@ -1,0 +1,44 @@
+# Virtual Environments
+lab8_venv/
+venv312/
+venv/
+env/
+*.pyc
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Data Directories (large files)
+reddit_data/
+word2vec_visualizations/
+visualizations/
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model files (can be large)
+*.model
+*.model.trainables.syn1neg.npy
+*.model.wv.vectors.npy
+
+# Temporary files
+*.tmp
+*.log

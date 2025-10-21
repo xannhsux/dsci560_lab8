@@ -221,7 +221,8 @@ def evaluate_vectors(vectors: Sequence[Sequence[float]], n_clusters: int) -> Dic
     if len(set(labels)) < 2:
         return {"silhouette": None, "calinski_harabasz": None, "davies_bouldin": None}
 
-    silhouette = silhouette_score(data, labels)
+    # Use cosine metric for silhouette to match Doc2Vec evaluation and assignment requirements
+    silhouette = silhouette_score(data, labels, metric='cosine')
     calinski = calinski_harabasz_score(data, labels)
     davies = davies_bouldin_score(data, labels)
     return {
@@ -250,8 +251,8 @@ def main() -> None:
     parser.add_argument(
         "--dimensions",
         type=parse_dimensions,
-        default=[50, 100, 300],
-        help="Comma-separated list of embedding dimensions to evaluate (default: 50,100,300)",
+        default=[50, 100, 200],
+        help="Comma-separated list of embedding dimensions to evaluate (default: 50,100,200)",
     )
     parser.add_argument(
         "--db-path",
