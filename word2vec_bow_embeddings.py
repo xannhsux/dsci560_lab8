@@ -295,7 +295,46 @@ def main() -> None:
         action="store_true",
         help="Use MiniBatchKMeans instead of full KMeans for word clustering",
     )
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default="word2vec,doc2vec",
+        help="Comma-separated list of methods to run: word2vec, doc2vec, or both (default: word2vec,doc2vec)",
+    )
+    parser.add_argument(
+        "--skip-word2vec",
+        action="store_true",
+        help="Skip Word2Vec bag-of-bins generation",
+    )
+    parser.add_argument(
+        "--skip-doc2vec",
+        action="store_true",
+        help="Skip Doc2Vec generation",
+    )
     args = parser.parse_args()
+
+    # Determine which methods to run
+    run_word2vec = True
+    run_doc2vec = True
+
+    # Process skip flags first (they take precedence)
+    if args.skip_word2vec:
+        run_word2vec = False
+    if args.skip_doc2vec:
+        run_doc2vec = False
+
+    # If methods is specified and different from default, use it
+    # (unless skip flags were used)
+    if args.methods != "word2vec,doc2vec" and not (args.skip_word2vec or args.skip_doc2vec):
+        methods = [m.strip().lower() for m in args.methods.split(",")]
+        run_word2vec = "word2vec" in methods
+        run_doc2vec = "doc2vec" in methods
+
+    # Validate that at least one method is selected
+    if not run_word2vec and not run_doc2vec:
+        parser.error("At least one method must be selected (both cannot be skipped)")
+
+    logging.info("Methods to run: Word2Vec=%s, Doc2Vec=%s", run_word2vec, run_doc2vec)
 
     logging.info("Loading posts from %s", args.db_path)
     posts = load_posts(args.db_path)
@@ -308,14 +347,18 @@ def main() -> None:
     post_ids = [post["id"] for post in posts]
     logging.info("Prepared %d posts for embedding generation", len(posts))
 
-    logging.info("Training shared Word2Vec model (size=%d)", args.word2vec_size)
-    word2vec_model = train_word2vec(
-        tokenized_posts,
-        vector_size=args.word2vec_size,
-        min_count=args.min_count,
-        epochs=args.epochs,
-        window=args.window,
-    )
+    # Only train Word2Vec model if we need it for Word2Vec BoW
+    if run_word2vec:
+        logging.info("Training shared Word2Vec model (size=%d)", args.word2vec_size)
+        word2vec_model = train_word2vec(
+            tokenized_posts,
+            vector_size=args.word2vec_size,
+            min_count=args.min_count,
+            epochs=args.epochs,
+            window=args.window,
+        )
+    else:
+        word2vec_model = None
 
     ensure_directory(args.output_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -324,48 +367,69 @@ def main() -> None:
     for dimension in args.dimensions:
         logging.info("Processing dimension %d", dimension)
 
-        word_clusters, actual_bins = cluster_word_vectors(
-            word2vec_model, dimension, mini_batch=args.mini_batch
-        )
-        word_bins_path = args.output_dir / f"word2vec_bins_{dimension}.json"
-        with open(word_bins_path, "w", encoding="utf-8") as handle:
-            json.dump(word_clusters, handle, indent=2)
+        dim_summary = {}
+        cluster_count = None
 
-        bow_vectors, bow_ids = build_doc_vectors(posts, tokenized_posts, word_clusters, actual_bins)
-        bow_path = args.output_dir / f"word2vec_bow_{dimension}.npy"
-        save_vectors(bow_path, bow_vectors, bow_ids)
+        # Process Word2Vec Bag-of-Bins if enabled
+        if run_word2vec:
+            word_clusters, actual_bins = cluster_word_vectors(
+                word2vec_model, dimension, mini_batch=args.mini_batch
+            )
+            word_bins_path = args.output_dir / f"word2vec_bins_{dimension}.json"
+            with open(word_bins_path, "w", encoding="utf-8") as handle:
+                json.dump(word_clusters, handle, indent=2)
 
-        cluster_count = choose_cluster_count(len(bow_vectors))
-        bow_scores = evaluate_vectors(bow_vectors, cluster_count)
+            bow_vectors, bow_ids = build_doc_vectors(posts, tokenized_posts, word_clusters, actual_bins)
+            bow_path = args.output_dir / f"word2vec_bow_{dimension}.npy"
+            save_vectors(bow_path, bow_vectors, bow_ids)
 
-        doc2vec_vectors, doc2vec_model = train_doc2vec(
-            tokenized_posts, post_ids, vector_size=dimension, epochs=args.epochs
-        )
-        doc2vec_path = args.output_dir / f"doc2vec_{dimension}.npy"
-        save_vectors(doc2vec_path, doc2vec_vectors, post_ids)
-        doc2vec_model_path = args.output_dir / f"doc2vec_{dimension}.model"
-        doc2vec_model.save(str(doc2vec_model_path))
-        doc2vec_scores = evaluate_vectors(doc2vec_vectors, cluster_count)
+            cluster_count = choose_cluster_count(len(bow_vectors))
+            bow_scores = evaluate_vectors(bow_vectors, cluster_count)
 
-        summary[str(dimension)] = {
-            "word2vec_bow": {
+            dim_summary["word2vec_bow"] = {
                 "dimension": actual_bins,
                 "clusters_evaluated": cluster_count,
                 **bow_scores,
-            },
-            "doc2vec": {
+            }
+        else:
+            bow_scores = None
+
+        # Process Doc2Vec if enabled
+        if run_doc2vec:
+            doc2vec_vectors, doc2vec_model = train_doc2vec(
+                tokenized_posts, post_ids, vector_size=dimension, epochs=args.epochs
+            )
+            doc2vec_path = args.output_dir / f"doc2vec_{dimension}.npy"
+            save_vectors(doc2vec_path, doc2vec_vectors, post_ids)
+            doc2vec_model_path = args.output_dir / f"doc2vec_{dimension}.model"
+            doc2vec_model.save(str(doc2vec_model_path))
+
+            # Use same cluster count as Word2Vec if available, otherwise calculate it
+            if cluster_count is None:
+                cluster_count = choose_cluster_count(len(doc2vec_vectors))
+            doc2vec_scores = evaluate_vectors(doc2vec_vectors, cluster_count)
+
+            dim_summary["doc2vec"] = {
                 "dimension": dimension,
                 "clusters_evaluated": cluster_count,
                 **doc2vec_scores,
-            },
-        }
+            }
+        else:
+            doc2vec_scores = None
 
-        logging.info(
-            "Dimension %d complete | Word2Vec silhouette: %s | Doc2Vec silhouette: %s",
-            dimension,
-            f"{bow_scores['silhouette']:.4f}" if bow_scores["silhouette"] is not None else "N/A",
-            f"{doc2vec_scores['silhouette']:.4f}" if doc2vec_scores["silhouette"] is not None else "N/A",
-        )
+        # Only add to summary if we have results
+        if dim_summary:
+            summary[str(dimension)] = dim_summary
+
+        # Log completion status
+        log_parts = [f"Dimension {dimension} complete"]
+        if bow_scores:
+            log_parts.append(f"Word2Vec silhouette: {bow_scores['silhouette']:.4f}"
+                           if bow_scores["silhouette"] is not None else "Word2Vec silhouette: N/A")
+        if doc2vec_scores:
+            log_parts.append(f"Doc2Vec silhouette: {doc2vec_scores['silhouette']:.4f}"
+                           if doc2vec_scores["silhouette"] is not None else "Doc2Vec silhouette: N/A")
+        logging.info(" | ".join(log_parts))
 
     report_path = args.output_dir / f"embedding_comparison_{timestamp}.json"
     with open(report_path, "w", encoding="utf-8") as handle:
@@ -380,46 +444,67 @@ def main() -> None:
         )
 
     logging.info("Comparison report saved to %s", report_path)
-    print("\n=== Comparison Summary ===")
+
+    # Determine header based on which methods were run
+    if run_word2vec and run_doc2vec:
+        print("\n=== Comparison Summary ===")
+    elif run_word2vec:
+        print("\n=== Word2Vec Bag-of-Bins Summary ===")
+    elif run_doc2vec:
+        print("\n=== Doc2Vec Summary ===")
+
     for dimension in args.dimensions:
         dim_key = str(dimension)
         if dim_key not in summary:
             continue
-        word_scores = summary[dim_key]["word2vec_bow"]
-        doc_scores = summary[dim_key]["doc2vec"]
+
+        dim_data = summary[dim_key]
         print(f"Dimension {dim_key}:")
-        print(
-            f"  Word2Vec bag-of-bins silhouette: "
-            f"{word_scores['silhouette']:.4f}" if word_scores["silhouette"] is not None else "  Word2Vec bag-of-bins silhouette: N/A"
-        )
-        print(
-            f"  Doc2Vec silhouette: "
-            f"{doc_scores['silhouette']:.4f}" if doc_scores["silhouette"] is not None else "  Doc2Vec silhouette: N/A"
-        )
-        print(
-            f"  Word2Vec Calinski-Harabasz: "
-            f"{word_scores['calinski_harabasz']:.2f}" if word_scores["calinski_harabasz"] is not None else "  Word2Vec Calinski-Harabasz: N/A"
-        )
-        print(
-            f"  Doc2Vec Calinski-Harabasz: "
-            f"{doc_scores['calinski_harabasz']:.2f}" if doc_scores["calinski_harabasz"] is not None else "  Doc2Vec Calinski-Harabasz: N/A"
-        )
-        print(
-            f"  Word2Vec Davies-Bouldin: "
-            f"{word_scores['davies_bouldin']:.4f}" if word_scores["davies_bouldin"] is not None else "  Word2Vec Davies-Bouldin: N/A"
-        )
-        print(
-            f"  Doc2Vec Davies-Bouldin: "
-            f"{doc_scores['davies_bouldin']:.4f}" if doc_scores["davies_bouldin"] is not None else "  Doc2Vec Davies-Bouldin: N/A"
-        )
-        better = []
-        if word_scores["silhouette"] and doc_scores["silhouette"]:
-            if word_scores["silhouette"] > doc_scores["silhouette"]:
-                better.append("Word2Vec silhouette")
-            elif doc_scores["silhouette"] > word_scores["silhouette"]:
-                better.append("Doc2Vec silhouette")
-        if better:
-            print("  Better metric(s): " + ", ".join(better))
+
+        # Get scores for each method if available
+        word_scores = dim_data.get("word2vec_bow")
+        doc_scores = dim_data.get("doc2vec")
+
+        # Display Word2Vec scores if available
+        if word_scores:
+            print(
+                f"  Word2Vec bag-of-bins silhouette: "
+                f"{word_scores['silhouette']:.4f}" if word_scores["silhouette"] is not None else "  Word2Vec bag-of-bins silhouette: N/A"
+            )
+            print(
+                f"  Word2Vec Calinski-Harabasz: "
+                f"{word_scores['calinski_harabasz']:.2f}" if word_scores["calinski_harabasz"] is not None else "  Word2Vec Calinski-Harabasz: N/A"
+            )
+            print(
+                f"  Word2Vec Davies-Bouldin: "
+                f"{word_scores['davies_bouldin']:.4f}" if word_scores["davies_bouldin"] is not None else "  Word2Vec Davies-Bouldin: N/A"
+            )
+
+        # Display Doc2Vec scores if available
+        if doc_scores:
+            print(
+                f"  Doc2Vec silhouette: "
+                f"{doc_scores['silhouette']:.4f}" if doc_scores["silhouette"] is not None else "  Doc2Vec silhouette: N/A"
+            )
+            print(
+                f"  Doc2Vec Calinski-Harabasz: "
+                f"{doc_scores['calinski_harabasz']:.2f}" if doc_scores["calinski_harabasz"] is not None else "  Doc2Vec Calinski-Harabasz: N/A"
+            )
+            print(
+                f"  Doc2Vec Davies-Bouldin: "
+                f"{doc_scores['davies_bouldin']:.4f}" if doc_scores["davies_bouldin"] is not None else "  Doc2Vec Davies-Bouldin: N/A"
+            )
+
+        # Only show comparison if both methods were run
+        if word_scores and doc_scores:
+            better = []
+            if word_scores["silhouette"] is not None and doc_scores["silhouette"] is not None:
+                if word_scores["silhouette"] > doc_scores["silhouette"]:
+                    better.append("Word2Vec silhouette")
+                elif doc_scores["silhouette"] > word_scores["silhouette"]:
+                    better.append("Doc2Vec silhouette")
+            if better:
+                print("  Better metric(s): " + ", ".join(better))
         print()
 
 
